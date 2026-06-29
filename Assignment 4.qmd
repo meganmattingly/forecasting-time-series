@@ -1,0 +1,230 @@
+---
+title: 'Assignment 4: Time Series Model Selection and Validation' 
+author: "Megan Mattingly" 
+format: 
+  html:
+    fig-align: center # Center figure alignment
+    embed-resources: true # Force document to be self-contained (critical!)
+    code-fold: true # Turn on code fold
+    toc: true # Create table of contents
+execute: 
+  warning: false # Turn off warnings
+---
+
+# Section 1
+
+To perform model selection and validation on the Cincinnati streetcar ridership data set, we must first split the data into training and test sets. We will train on approximately 80% of the data, and reserve approximately 20% for testing. 
+
+```{r, message=FALSE, warning = FALSE}
+library(readr)
+library(ggplot2)
+library(tsibble)
+library(tidyverse)
+library(fable)
+library(feasts)
+library(kableExtra)
+library(patchwork)
+
+#Import data
+streetcar_raw <- read_csv("streetcar_ridership.csv")
+
+#Convert to tsibble
+streetcar <- streetcar_raw %>%
+  mutate(day = date(date)) %>%
+  as_tsibble(index = day) %>%
+  select(day, ridership)
+
+#Split into train and test sets (approx 80/20)
+streetcar_train <- streetcar %>%
+  filter(day <= '2024-10-15')
+
+streetcar_test <- streetcar %>%
+  filter(day > '2024-10-15')
+
+#Plot training and test data together
+streetcar_train %>%
+  bind_rows(streetcar_test) %>%
+  ggplot() +
+  geom_line(aes(day, ridership)) +
+  geom_vline(xintercept = as.Date("2024-10-15"),
+             color = 'red', linetype = 'dashed', linewidth = 1) +
+  labs(title = "Cincinnati Streetcar Ridership",
+       subtitle = "Training and test data split at October 15, 2024",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+
+```
+
+In the plot above, we can see the point where the training and test sets are divided. This gives us about 9.5 months of data for training and 2.5 months for testing. For the most part, it appears that the test data is representative of the training data. There are peaks and troughs that follow the same general pattern of the rest of the data set. However, there is one high outlier that falls at the end of October. This value is inconsistent with the rest of the data and could impact the predictions on the test set. 
+
+
+# Section 2
+
+We perform cross-validation on the training data, meaning there is 9.5 months to work with. We will set the initial training period as about 6 months and then step forward one week at a time, creating 16 iterations in total. 
+
+```{r}
+
+#Set up cross-validation data set
+#Train on ~6 months, step forward one week
+streetcar_cv <- streetcar_train %>%
+  stretch_tsibble(.init = 180, .step = 7)
+
+#Visualize the CV folds
+streetcar_cv %>%
+  ggplot() +
+  geom_point(aes(day, factor(.id), color = factor(.id)), size = 1) +
+  labs(title = "Time Series Cross-Validation Folds",
+       x = "Date", y = "Fold") +
+  guides(color = 'none') +
+  theme_minimal()
+
+```
+
+
+# Section 3
+
+Next, we will compare an auto-ARIMA model and a seasonal naive model to see which performs best in the cross-validation scheme. Since prior analysis has indicated that the time series is variance non-stationary, we will apply a log transformation before fitting the ARIMA model. We fit the models to the training data for each fold and then created seven-day forecasts. 
+
+```{r, warning=FALSE, message = FALSE}
+
+#Fit best ARIMA and seasonal naive model
+cv_models <- streetcar_cv %>%
+  model(
+    snaive = SNAIVE(ridership),
+    arima = ARIMA(log(ridership)~pdq(1,0,1)+PDQ(0,1,1))
+    #arima = ARIMA(box_cox(ridership,lambda)~pdq(1,1,1)+PDQ(2,0,0))
+  )
+
+#Forecast one week ahead for each fold
+cv_forecasts <- cv_models %>%
+  forecast(h = 7)
+
+#Visualize forecasts by fold
+#Plot actual vs predicted for each CV fold
+cv_forecasts %>%
+  as_tibble() %>%
+  select(-ridership) %>%
+  left_join(streetcar_train) %>%
+  ggplot() +
+  geom_line(aes(day, ridership), color = "black", linewidth = 0.6) +
+  geom_line(aes(day, .mean, color = factor(.id), linetype = .model)) +
+  scale_color_viridis_d(name = "CV Fold") +
+  scale_linetype_manual(values = c("snaive" = "dashed", "arima" = "solid"),
+                        name = "Model") +
+  labs(title = "Actual vs Predicted by CV Fold",
+       subtitle = "Black line = actual values; colored lines = forecasts from each fold",
+       x = "Date", y = "Ridership") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+```
+
+The plot above shows the actual data and forecasts for both models at each cross-validation fold. It appears that the ARIMA model is outperforming the seasonal naive model. Since the naive model simply forecasts the value from the last week, it tends to overestimate peaks and troughs in the data. 
+
+To compare these models more formally, we will begin by looking at their performance at each forecast horizon. 
+
+::: {.panel-tabset}
+## RMSE
+
+```{r, warning=FALSE}
+
+#Calculate accuracy by forecast horizon
+cv_accuracy_by_h <- cv_forecasts %>%
+  group_by(.id, .model) %>%
+  mutate(h = row_number()) %>%
+  ungroup() %>%
+  as_fable(response = "ridership", distribution = ridership) %>%
+  accuracy(streetcar_train, by = c("h", ".model"))
+
+#Plot RMSE by horizon
+cv_accuracy_by_h %>%
+  ggplot(aes(x = h, y = RMSE, color = .model)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  labs(title = "RMSE by Forecast Horizon",
+       subtitle = "ARIMA tends to outperform seasonal naive",
+       x = "Days Ahead", y = "RMSE") +
+  scale_color_manual(values = c("snaive" = "steelblue", "arima" = "coral")) +
+  theme_minimal()
+
+
+```
+
+## MAPE
+
+
+```{r}
+
+#Plot MAPE by horizon
+cv_accuracy_by_h %>%
+  ggplot(aes(x = h, y = MAPE, color = .model)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  labs(title = "MAPE by Forecast Horizon",
+       subtitle = "ARIMA tends to outperform seasonal naive",
+       x = "Days Ahead", y = "MAPE (%)") +
+  scale_color_manual(values = c("snaive" = "steelblue", "arima" = "coral")) +
+  theme_minimal()
+```
+
+:::
+
+When looking at the RMSE, the ARIMA model tends to outperform the seasonal naive model at most time horizons. The only exception is 5 days in the future, where the seasonal naive model has a lower RMSE. The MAPE shows a similar trend, with the ARIMA model performing better at all time horizons except 3 and 5 days ahead. The process of selecting the "best" model depends on the goal of the forecast. Both metrics indicate that the ARIMA model is better in the short term, but as you look further into the future, there is not as much distinction.  
+
+We also look at the overall accuracy of the models. The table below shows these metrics for the entire training data, as opposed to each cross-validation fold. The ARIMA model performs better in every category, so we will proceed with this model. 
+
+```{r, warning = FALSE}
+
+#Calculate overall accuracy measures
+cv_forecasts %>%
+  accuracy(streetcar_train) %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  arrange(RMSE) %>%
+  kable(align = 'c') %>%
+  kable_styling()
+```
+
+
+# Section 4
+
+Finally, we will refit the selected ARIMA model to the entire training data and create forecasts on the test set. 
+```{r}
+
+#Fit ARIMA model on full training data
+final_model <- streetcar_train %>%
+  model(arima = ARIMA(log(ridership)~pdq(1,0,1)+PDQ(0,1,1)))
+
+#Generate final forecast
+final_forecast <- final_model %>%
+  forecast(h = 77) #The size of the test data set 
+
+#Plot with prediction intervals
+final_forecast %>%
+  autoplot(streetcar_train %>% bind_rows(streetcar_test)) + 
+  geom_line(data = streetcar_test, aes(day, ridership),
+            color = "black", linewidth = 1) +
+  labs(title = "Final ARIMA Forecast vs Actual (10/15-12/31)",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+
+
+```
+
+At first glance, the model seems to be performing okay on the test data. The predicted values are consistently higher than the actual values, but for the most part, the actual values fall within the prediction intervals. However, there is a very high outlier at the end of October that the model did not capture. 
+
+The table below summarizes the accuracy of the model on the test set. 
+
+```{r}
+#Final accuracy
+final_accuracy <- final_forecast %>%
+  accuracy(streetcar_train %>% bind_rows(streetcar_test))
+
+final_accuracy %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  kable(align = 'c') %>%
+  kable_styling()
+```
+
+Our model performed with 42.4% average deviation from real values during out-of-sample testing. This corresponds to an average error of 1,728 riders. These values are much higher than the in-sample values for the ARIMA model, which is a sign of overfitting. However, we must also take into account the outlier in the test set, which has an extremely large error associated with it and is likely skewing the results.
+

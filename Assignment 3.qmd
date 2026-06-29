@@ -1,0 +1,256 @@
+---
+title: 'Assignment 3: Time Series ARIMA Modeling' 
+author: "Megan Mattingly"
+format: 
+  html:
+    fig-align: center # Center figure alignment
+    embed-resources: true # Force document to be self-contained (critical!)
+    code-fold: true # Turn on code fold
+    toc: true # Create table of contents
+execute: 
+  warning: false # Turn off warnings
+---
+
+# Section 1
+
+For this analysis, we will be working with the Cincinnati streetcar ridership data set, which is shown below. While ridership increases slightly in the summer, there is not a particularly strong overall trend. However, there are very consistent peaks and troughs in the data, which prior analysis has shown is driven by weekly seasonality. 
+
+```{r, message = FALSE}
+library(readr)
+library(ggplot2)
+library(tsibble)
+library(tidyverse)
+library(fable)
+library(feasts)
+library(kableExtra)
+library(patchwork)
+
+#Import data
+streetcar_raw <- read_csv("streetcar_ridership.csv")
+
+#Convert to tsibble
+streetcar <- streetcar_raw %>%
+  mutate(day = date(date)) %>%
+  as_tsibble(index = day) %>%
+  select(day, ridership)
+
+#Time series plot
+streetcar %>%
+  autoplot(ridership) +
+  labs(title = "Cincinnati Streetcar Ridership",
+       x = "Date", y = "Riders") +
+  theme_bw()
+
+```
+
+It is not likely that the average number of people riding the streetcar is changing significantly over time, so we would expect the time series would be mean stationary. This is confirmed in the plot above, where the values in January 2025 return to approximately what they were in January 2024. However, it does make sense that there would be more fluctuation in the number of people riding the streetcar at different times of the year, so we would probably not expect the time series to be variance stationary. The plot does appear to show more variation in the summer than at other times of the year. In order to assess this hypothesis, we will plot the rolling standard deviation. 
+
+```{r, message = FALSE, warning = FALSE}
+
+#Get lambda for Box Cox
+  lambda = streetcar %>%
+  features(ridership, features = guerrero) %>%
+  pull(lambda_guerrero)
+
+#Calculate variance stabilizing transformations 
+streetcar_transformation = streetcar %>%
+  mutate(riders_log = log(ridership),
+         riders_box = box_cox(ridership,lambda))
+
+#Testing for variance stationarity
+streetcar_rolling <- streetcar_transformation %>%
+  mutate(rolling_sd = slider::slide_dbl(ridership, sd, .before = 30, .after = 0), 
+         rolling_sd_log = slider::slide_dbl(riders_log, sd, .before = 30, .after = 0), 
+         rolling_sd_box = slider::slide_dbl(riders_box, sd, .before = 30, .after = 0))
+
+#Plot rolling SD with trend line (untransformed data)
+streetcar_rolling %>%
+  ggplot(aes(x = day, y = rolling_sd)) +
+  geom_line(linewidth = 1, color = "black") +
+  geom_smooth(aes(day, rolling_sd),method = 'lm',se = F) +
+  labs(title = "31-Day Rolling Standard Deviation",
+       x = "Date", y = "Std Dev") +
+  theme_bw()
+
+
+```
+
+This chart clearly shows that the variance is not stationary, so we need to apply a transformation to the time series. The simplest option is a log transformation, but we will also try a Box-Cox transformation, to see which stabilizes the variance best.
+
+::: {.panel-tabset}
+## Log Transformation
+
+```{r, message = FALSE, warning = FALSE}
+#Plot rolling SD with trend line (after log transformation)
+streetcar_rolling %>%
+  ggplot(aes(x = day, y = rolling_sd_log)) +
+  geom_line(linewidth = 1, color = "black") +
+  geom_smooth(aes(day, rolling_sd_log),method = 'lm',se = F) +
+  labs(title = "31-Day Rolling Standard Deviation (Log Transformation)",
+       x = "Date", y = "Std Dev") +
+  theme_bw()
+
+```
+
+## Box-Cox Transformation
+
+```{r}
+#Plot rolling SD with trend line (after Box Cox transformation)
+streetcar_rolling %>%
+  ggplot(aes(x = day, y = rolling_sd_box)) +
+  geom_line(linewidth = 1, color = "black") +
+  geom_smooth(aes(day, rolling_sd_box),method = 'lm',se = F) +
+  labs(title = "31-Day Rolling Standard Deviation (Box-Cox Transformation)",
+       x = "Date", y = "Std Dev") +
+  theme_bw()
+
+```
+
+:::
+
+Based on the above plots, we see that a Box-Cox transformation is necessary to create variance stationarity. Next, since we know that there is some weekly seasonality in the data, we will perform seasonal differencing on the transformed data. We will difference the time points $Z_t-Z_{t-7}$ in order to remove the seasonal effect. 
+
+
+```{r, message = FALSE, warning = FALSE}
+#Calculate seasonal differencing
+streetcar_diff <- streetcar_transformation %>%
+  mutate(diff = riders_box - lag(riders_box,7))
+
+streetcar_diff %>%
+autoplot(diff)+
+labs(title = "Cincinnati Streetcar Ridership - Stationary",
+       x = "Date", y = " Box-Cox Seasonal Difference") + 
+  theme_bw()
+```
+The time series in the above plot now looks to be stationary. There are still a few outliers, but overall, the series is mean-reverting and has fairly constant variance. In order to confirm this, we will perform a KPSS test. 
+
+```{r}
+#Test for mean stationarity
+# Differenced Box-Cox close value
+box_diff_kpss <- streetcar_diff %>%
+features(diff, unitroot_kpss)
+
+box_diff_kpss %>%
+  kable(align = 'c') %>%
+  kable_styling()
+```
+
+Since the null hypothesis for this test is that the data is stationary, a p-value of 0.1 means that we fail to reject the null hypothesis, and can conclude that our time series is now stationary. 
+
+# Section 2
+
+Now, we will look at the ACF and PACF plots of our transformed time series to learn more about it's behavior. 
+
+```{r}
+acf = streetcar_diff %>%
+  ACF(diff,lag_max=10) %>%
+  autoplot()
+
+pacf =  streetcar_diff %>%
+  fill_gaps() %>%
+  PACF(diff,lag_max=10) %>%
+  autoplot()
+
+acf + pacf
+```
+
+The ACF plot does not show strong dampening, so the time series is probably not autoregressive. There is one statistically significant lag in ACF, which could indicate an order one moving average process. Also, there are statistically significant lags at $t=7$ in both plots, even after seasonal differencing, meaning there may be some more complex seasonal AR and MA processes involved, but these are hard to discern from the plots alone. Based on this information, and the fact that we performed seasonal differencing earlier, we suspect that the order of the time series is ARIMA(0,0,1)(0,1,0). 
+
+# Section 3
+
+Based on our hypotheses about the order of the ARIMA model, we will manually fit several options and compare the results using the BIC.
+
+```{r}
+#Manually fit ARIMA models based on ACF/PACF plots
+models_bic = streetcar %>%
+  model(
+    mod1 = ARIMA(box_cox(ridership,lambda)~pdq(0,0,1)+PDQ(0,1,0)),
+    mod2 = ARIMA(box_cox(ridership,lambda)~pdq(0,0,1)+PDQ(1,1,0)),
+    mod3 = ARIMA(box_cox(ridership,lambda)~pdq(0,0,1)+PDQ(0,1,1)),
+    mod4 = ARIMA(box_cox(ridership,lambda)~pdq(1,0,1)+PDQ(0,1,0)),
+    mod5 = ARIMA(box_cox(ridership,lambda)~pdq(1,0,1)+PDQ(1,1,0))
+  )
+
+models_bic %>%
+  glance() %>%
+  arrange(BIC)
+```
+
+According to the BIC of the tested models, the best option is an ARIMA(0,0,1)(0,1,1), meaning there is a moving average of order 1, a first order seasonal integration, and a seasonal moving average of order 1. 
+
+Next, we will implement the auto-ARIMA to find the best fit for the data. 
+
+```{r}
+#Auto fit ARIMA
+auto_model <- streetcar %>%
+model(
+  ARIMA(box_cox(ridership,lambda),approximation = F, stepwise = F)
+) 
+
+auto_model %>%
+report()
+```
+
+The results of the auto-ARIMA are quite different than the other models tested. The selected model is an ARIMA(1,1,1)(2,0,0), meaning that the time series has first order autoregressive and moving average processes, a second order seasonal autoregressive process, and perhaps most surprising, a first order integration as opposed to a first order seasonal integration. However, the BIC of this final model is -5195, which is a large reduction from the prior models. This difference is likely due to the strength of the seasonality in the data. While there is some seasonality in the data, it is not extreme, so it's possible that a regular difference is able to capture the data generating process as well or better than a seasonal difference. 
+
+
+In order to confirm that the auto-ARIMA accurately captures the data generating process, we'll plot the fitted values against the observed time series. 
+
+```{r}
+#Plot in-sample predictions and observed values
+#Get fitted values
+fitted = auto_model %>%
+  augment() %>%
+  .$.fitted
+
+ggplot() +
+  geom_line(aes(streetcar$day, streetcar$ridership)) +
+  geom_line(aes(streetcar$day, fitted), color = "blue", alpha = 0.4) +
+  theme_bw() +
+  xlab("Date") +
+  ylab("S&P 500")
+```
+
+The in-sample predictions seem to match the observed predictions fairly well. We see a slight overall increase in ridership in the summer, before decreasing again, and the peaks and troughs tend to line up. There are a couple of outliers in the observed values that the predictions do not capture, but since we don't want to over fit the data, this is actually a good thing. 
+
+
+# Section 4
+
+Finally, we will examine the residuals to assess the quality of the model. 
+
+```{r}
+#Plot residuals
+auto_model %>%
+  gg_tsresiduals()
+```
+
+In the first plot, the residuals appear to be white noise, which indicates there is no predictive information left to be modeled. Also, there are no significant lags in the ACF plot, meaning that there is no remaining autocorrelation in the residuals. The histogram of residual values is centered around zero and looks close to normally distributed, albeit with a few outliers, which also suggests a good fit. 
+
+One way to formally test for autocorrelation of residuals is the Ljung-Box test, whose results are shown below. 
+
+```{r}
+#Calculate Ljung-Box test
+auto_model %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 10, dof = 4) %>%
+  kable(align = 'c') %>%
+  kable_styling()
+```
+
+A large p-value means there is no remaining autocorrelation in the residuals, confirming what we saw in the residual plots. 
+
+Our last step is to create a six day forecast for our time series. The point forecasts, along with the prediction intervals, are plotted below. 
+
+```{r, warning = FALSE}
+#Create a 6 day forecast
+forecast = auto_model %>%
+  forecast(h=6)
+
+forecast %>%
+  autoplot(streetcar) +
+  labs(title = "Cincinnati Streetcar Ridership 6-Day Forecast",
+       x = "Month", y = "Ridership") + 
+    theme_bw()
+```
+
+Overall, these forecasts look reasonable. The peaks and troughs follow prior patterns and the prediction intervals are wide enough that they seem likely to capture the true value. Also, there is not a sharp increase or decrease from the most recent values, which is consistent with the relatively flat trend seen across the time series. 

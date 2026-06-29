@@ -1,0 +1,665 @@
+---
+title: 'BANA 7050: Final Project'
+author: "Megan Mattingly"
+format:
+  html:
+    fig-align: center # Center figure alignment
+    embed-resources: true # Force document to be self-contained (critical!)
+    code-fold: true # Turn on code fold
+    toc: true # Create table of contents
+execute: 
+  warning: false # Turn off warnings
+---
+
+## Section 1: Exploratory Data Analysis and Time Series Decomposition
+
+This analysis will be completed using the Cincinnati Streetcar Ridership data set. The streetcar is a form of free public transportation in downtown Cincinnati that connects the Banks to Over-the-Rhine. It covers a 3.6 mile loop and there are 5 streetcars. This data set contains daily ridership data from 2024. The data-generating process is tied to the total number of people in downtown Cincinnati. There are likely more streetcar riders on weekends or when there are events going on in the Banks or OTR. We will begin by visualizing the time-series in order to better understand the behavior of the data. 
+
+```{r, message = FALSE}
+library(readr)
+library(ggplot2)
+library(tsibble)
+library(tidyverse)
+library(fable)
+library(fable.prophet)
+library(feasts)
+library(kableExtra)
+library(patchwork)
+
+#Import data
+streetcar_raw <- read_csv("streetcar_ridership.csv")
+
+#Convert to tsibble
+streetcar <- streetcar_raw %>%
+  mutate(day = date(date)) %>%
+  as_tsibble(index = day) %>%
+  select(day, ridership)
+
+#Time series plot
+streetcar %>%
+  autoplot(ridership) +
+  labs(title = "Cincinnati Streetcar Ridership",
+       x = "Date", y = "Riders") +
+  theme_minimal()
+
+```
+
+
+While ridership increases slightly in the summer, there is not a lot of variation in the overall trend. Most of the peaks and troughs in the data are very consistent, meaning that they may be driven by a seasonal component. There is one exceptionally large peak in October 2024, which could be considered an outlier. The following plots describe the data distribution more in-depth. 
+
+```{r, message=FALSE}
+#Histogram of data distribution
+p1 <- streetcar %>%
+  ggplot() +
+  geom_histogram(aes(ridership)) +
+  labs(x = "Riders", y = "Count") +
+  theme_minimal()
+
+#Boxplot
+p2 <- streetcar %>%
+  ggplot() +
+  geom_boxplot(aes("", ridership)) +
+  labs(y = "Riders") + 
+  theme_minimal()
+
+p1 + p2
+```
+
+These plots confirm that there are likely some outliers in the data. Specifically, there were two days where ridership was over 10,000, which is out of the ordinary. Even if we ignore these points, the histogram shows that the data is still right skewed, meaning that there tends to be more days with fewer riders. 
+
+
+```{r}
+# Summary statistics
+streetcar %>%
+  features(ridership, list(
+    Mean = mean,
+    Median = median,
+    StandardDeviation = sd,
+    Minimum = min,
+    Maximum = max,
+    Q1 = ~ quantile(., 0.25),
+    Q3 = ~ quantile(., 0.75)))  %>% 
+      kable() %>%
+        kable_styling()
+```
+
+We also calculated general summary statistics for streetcar ridership. The mean is higher than the median, which is numeric confirmation of right skewed data. There is a large difference in values between the third quartile and the maximum of the data, which indicates that there is a small number of days with high ridership. This goes back to the idea that special events can cause large fluctuations in the data.  
+
+To further investigate the trend of the time-series, we calculated a 31-order moving average for the data. The plot below shows the moving average plotted against the original data. 
+
+```{r}
+
+#Calculate moving average (order 31)
+streetcar_ma <- streetcar %>%
+  mutate(ma = slider::slide_dbl(ridership, mean, .before = 15, .after = 15))
+
+#Plot against original data
+streetcar_ma %>%
+  pivot_longer(cols = c(ridership, ma),
+               names_to = "series", values_to = "val") %>%
+  mutate(series = factor(series,
+                         levels = c("ridership", "ma"),
+                         labels = c("Original", "MA"))) %>%
+  ggplot(aes(x = day, y = val, color = series)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("Original" = "black", "MA" = "red")) + 
+  labs(title = "Cincinnati Streetcar Ridership with Moving Average",
+       x = "Date", y = "Riders", color = "Series") +
+  theme_minimal()
+
+```
+
+The moving average, shown in red, indicates that ridership increases between January and July, before decreasing for the rest of the year. We see a peak in October due to the large outlier discussed above. Next, we will create a time-series decomposition in order to look at remaining patterns in the data. 
+
+```{r}
+#STL decomposition and plot 
+streetcar %>%
+  model(STL(ridership)) %>%
+  components() %>% 
+    autoplot() + 
+      labs(title = "STL Decomposition - Cincinnnati Streetcar Ridership") + 
+      theme_minimal()
+
+```
+
+Based these charts, we see that there is weekly seasonality in the data. However, the magnitude of the seasonal component is not constant across the time-series. In order to further investigate seasonality, we will look at the remainder component and calculate ridership by day of the week.  
+
+```{r}
+#Estimate trend using 31-period MA and decompose
+streetcar_decomp <- streetcar %>%
+  mutate(
+    trend = slider::slide_dbl(ridership, mean, .before = 15, .after = 15),
+    remainder = ridership - trend
+  )
+
+#Check for seasonality after detrending
+#Aggregate by week
+streetcar_decomp %>%
+  mutate(wday_num = wday(day)) %>%
+  ggplot(aes(factor(wday_num), remainder)) + 
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  scale_x_discrete(labels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")) +
+  labs(title = "Cincinnati Streetcar Ridership by Week - After Detrending",
+       x = "Day of Week", y = "Remainder") +
+  geom_hline(yintercept=0,color='red') + 
+  theme_bw()
+
+```
+
+Based on this plot, we can see that ridership on Saturdays is higher than the other days of the week. This means that there is some weekly seasonality, although it may not be as strong as initially expected.  
+
+To perform model selection and validation on this data set, we must first split the data into training and test sets. We will train on approximately 80% of the data, and reserve approximately 20% for testing.
+
+```{r}
+#Split into train and test sets (approx 80/20)
+streetcar_train <- streetcar %>%
+  filter(day <= '2024-10-15')
+
+streetcar_test <- streetcar %>%
+  filter(day > '2024-10-15')
+
+#Plot training and test data together
+streetcar_train %>%
+  bind_rows(streetcar_test) %>%
+  ggplot() +
+  geom_line(aes(day, ridership)) +
+  geom_vline(xintercept = as.Date("2024-10-15"),
+             color = 'red', linetype = 'dashed', linewidth = 1) +
+  labs(title = "Cincinnati Streetcar Ridership",
+       subtitle = "Training and test data split at October 15, 2024",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+
+```
+
+In the plot above, we can see the point where the training and test sets are divided. This gives us about 9.5 months of data for training and 2.5 months for testing. The test data is generally representative of the training data, but there is one high outlier that falls at the end of October. This value is inconsistent with the rest of the data, so it is important to note that it could impact the predictions on the test set. 
+
+## Section 2: ARIMA Modeling
+
+First, we will build an ARIMA model to the time-series. ARIMA models require stationary data, so we will begin by investigating variance and mean stationarity. 
+
+The charts below compare the variance stationarity for the original data and the log transformed data. The transformation stabilizes the variance of the data well, so we will proceed with this data for building the model. 
+
+::: {.panel-tabset}
+## Original Data
+
+```{r}
+#Calculate Box-Cox transformations 
+streetcar_transformation <- streetcar_train %>%
+  mutate(riders_log = log(ridership))
+
+#Testing for variance stationarity
+streetcar_rolling <- streetcar_transformation %>%
+  mutate(rolling_sd = slider::slide_dbl(ridership, sd, .before = 30, .after = 0), 
+         rolling_sd_log = slider::slide_dbl(riders_log, sd, .before = 30, .after = 0))
+
+#Plot rolling SD with trend line (untransformed data)
+streetcar_rolling %>%
+  ggplot(aes(x = day, y = rolling_sd)) +
+  geom_line(linewidth = 1, color = "black") +
+  geom_smooth(aes(day, rolling_sd),method = 'lm',se = F) +
+  labs(title = "31-Day Rolling Standard Deviation",
+       x = "Date", y = "Standard Deviation") +
+  theme_minimal()
+
+```
+
+## Log Transformation
+
+```{r}
+#Plot rolling SD with trend line (after Log transformation)
+streetcar_rolling %>%
+  ggplot(aes(x = day, y = rolling_sd_log)) +
+  geom_line(linewidth = 1, color = "black") +
+  geom_smooth(aes(day, rolling_sd_log),method = 'lm',se = F) +
+  labs(title = "31-Day Rolling Standard Deviation (Log Transformation)",
+       x = "Date", y = "Standard Deviation") +
+  theme_minimal()
+
+```
+
+:::
+
+Next, since we know that there is some weekly seasonality in the data, we will perform seasonal differencing on the transformed data to reach mean stationarity. We will difference the time points $Z_t-Z_{t-7}$ in order to remove the seasonal effect. 
+
+```{r, message = FALSE, warning = FALSE}
+#Calculate seasonal differencing
+streetcar_diff <- streetcar_transformation %>%
+  mutate(diff = riders_log - lag(riders_log,7))
+
+streetcar_diff %>%
+autoplot(diff) +
+labs(title = "Cincinnati Streetcar Ridership - Stationary",
+       x = "Date", y = "Log Seasonal Difference") + 
+  theme_minimal()
+```
+
+The time series in the above plot now looks to be stationary. There are still a few outliers, but overall, the series is mean-reverting and has fairly constant variance. In order to confirm this, we will perform a KPSS test. 
+
+```{r}
+#Test for mean stationarity
+# Differenced Box-Cox close value
+box_diff_kpss <- streetcar_diff %>%
+features(diff, unitroot_kpss)
+
+box_diff_kpss %>%
+  kable(align = 'c') %>%
+  kable_styling()
+```
+
+Since the null hypothesis for the KPSS test is that the data is stationary, a p-value of 0.1 means that we fail to reject the null hypothesis, and can conclude that our time series is now stationary. 
+
+Now, we will look at the ACF and PACF plots of our transformed time series to learn more about it's behavior. 
+
+```{r}
+acf = streetcar_diff %>%
+  ACF(diff,lag_max=10) %>%
+  autoplot() + 
+  theme_minimal()
+
+pacf =  streetcar_diff %>%
+  fill_gaps() %>%
+  PACF(diff,lag_max=10) %>%
+  autoplot() + 
+  theme_minimal()
+
+acf + pacf
+```
+
+
+The ACF plot shows slight dampening, so the time series may contain autoregressive components. There is one statistically significant lag in the PACF plot, which indicates a potential AR(1) process. The statistically significant lag in the ACF plot could also indicate an MA(1) process. Also, there are large lags at $t=7$ in both plots, even after seasonal differencing, meaning there may be some more complex seasonal AR and MA processes involved, but these are hard to discern from the plots alone. Based on this information, and the fact that we performed seasonal differencing earlier, we suspect that the order of the time series is ARIMA(1,0,1)(0,1,0). 
+
+We will fit several ARIMA model options, both manual and automated, and compare the results using the BIC.
+
+```{r}
+#Fit ARIMA models based on ACF/PACF plots, plus an automated option
+models_bic = streetcar_train %>%
+  model(
+    mod1 = ARIMA(log(ridership)~pdq(1,0,1)+PDQ(0,1,0)),
+    mod2 = ARIMA(log(ridership)~pdq(1,0,1)+PDQ(1,1,0)),
+    mod3 = ARIMA(log(ridership)~pdq(1,0,1)+PDQ(0,1,1)),
+    auto = ARIMA(log(ridership),approximation = F, stepwise = F)
+  )
+
+models_bic %>%
+  glance() %>%
+  arrange(BIC)
+```
+
+```{r}
+
+models_bic %>%
+  select(auto) %>%
+  report()
+```
+The best model comes from the automated selection and is an ARIMA(1,0,0)(0,1,1) with drift, meaning that the time series has a first order autoregressive process, a first order seasonal integration, and a first order seasonal moving average process. We will proceed with this model for the remaining analysis. 
+
+In order to confirm that the auto-ARIMA accurately captures the data generating process, we'll plot the fitted values against the observed time series. 
+
+```{r}
+#Plot in-sample predictions and observed values
+#Get fitted values
+fitted = models_bic %>% select(auto) %>%
+  augment() %>%
+  .$.fitted
+
+ggplot() +
+  geom_line(aes(streetcar_train$day, streetcar_train$ridership)) +
+  geom_line(aes(streetcar_train$day, fitted), color = "blue", alpha = 0.4) +
+  labs(title = "Cincinnati Streetcar Ridership - ARIMA Actual vs. Fitted",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+```
+
+The in-sample predictions seem to match the observed predictions fairly well. The ARIMA captures the overall trend of the data and the peaks and troughs tend to line up. There are some cases where the predictions over or underestimate actual values more significantly, but since we don't want to over fit the data, this isn't too much of a concern. 
+
+Finally, we will examine the residuals to assess the quality of the model. 
+
+```{r}
+#Plot residuals
+models_bic %>%
+  select(auto) %>%
+  gg_tsresiduals() +
+  theme_minimal()
+```
+
+In the first plot, the residuals appear to be white noise, which indicates there is no predictive information left to be modeled. There is one significant lag in the ACF plot at t=18, but it is far enough removed that it's probably due to chance, as opposed to remaining autocorrelation in the residuals. Also, the histogram of residual values is centered around zero and looks close to normally distributed, albeit with a few outliers, which suggests a good fit. 
+
+One way to formally test for autocorrelation of residuals is the Ljung-Box test, whose results are shown below. We consider lag values of 7, 14, and 21, due to the weekly seasonal component. 
+
+```{r}
+#Calculate Ljung-Box test
+models_bic %>%
+  select(auto) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 7, dof = 3) %>%
+  kable(align = 'c') %>%
+  kable_styling()
+
+models_bic %>%
+  select(auto) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 14, dof = 3) %>%
+  kable(align = 'c') %>%
+  kable_styling()
+
+models_bic %>%
+  select(auto) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 21, dof = 3) %>%
+  kable(align = 'c') %>%
+  kable_styling()
+```
+
+A large p-value at all three lag values means there is no remaining autocorrelation in the residuals, confirming what we saw in the residual plots. 
+
+
+## Section 3: Meta Prophet Model
+
+Next, we will build a Prophet model for our time-series. The basis of the model comes from time-series decomposition and includes trend, seasonal, and holiday components. Prophet works well with daily, seasonal data, so it it a reasonable approach for our data set. 
+
+First, we will examine the elements of the time-series decomposition as identified by the default Prophet model. The plot below shows the trend, seasonality, and residual components. 
+
+```{r, warning=FALSE, message=FALSE}
+#Plot decomposition for initial model
+streetcar_train %>%
+  model(prophet = prophet(ridership)) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "Prophet Decomposition for Cincinnati Streetcar Ridership",
+       x = "Date") +
+  theme_minimal()
+```
+
+Prophet has identified a strictly increasing trend with additive seasonality and it appears that the residuals may not be entirely white noise. This means that some hyperparameter tuning is needed for this model.  
+
+By default, Prophet does not look at changepoints for the trend component in the last 20% of the data, but earlier plots have shown that ridership starts to decrease in the fall. Adjusting the range of the data where changepoints can be identified may allow this trend to be captured and make our model more accurate. Going forward, we will allow changepoints to be selected for the first 90% of the data.
+
+::: {.panel-tabset}
+
+## Considered Changepoints
+
+```{r, warning=FALSE, message=FALSE}
+#Examine considered changepoints for trend component
+changepoints = streetcar_train %>%
+  model(prophet = prophet(ridership~growth(changepoint_range=0.9)+
+                            season(period='week'))) %>%
+  glance() %>%
+  pull(changepoints) %>%
+  bind_rows() %>%
+  .$changepoints
+
+#Plot against training data
+streetcar_train %>%
+  ggplot()+
+  geom_line(aes(day, ridership)) +
+  geom_vline(xintercept = as.Date(changepoints),color = 'red',linetype = 'dashed') + 
+  labs(title = "Considered Changepoints - 90% of Data",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+  
+```
+
+## Selected Changepoints
+
+```{r, warning=FALSE, message=FALSE}
+#Examine selected changepoints for trend component
+changepoints = streetcar_train %>%
+  model(prophet = prophet(ridership~growth(changepoint_range=0.9)+
+                            season(period='week'))) %>%
+  glance() %>%
+  pull(changepoints) %>%
+  bind_rows() %>%
+   filter(abs(adjustment)>0.01) %>%
+  .$changepoints
+
+#Plot against training data
+streetcar_train %>%
+  ggplot()+
+  geom_line(aes(day, ridership)) +
+  geom_vline(xintercept = as.Date(changepoints),color = 'red',linetype = 'dashed') + 
+  labs(title = "Selected Changepoints - 90% of Data",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+
+```
+:::
+
+We see that the model has identified 13 changepoints in the data. They fall towards the middle of the data set, which makes sense, as this is where ridership starts to level off before decreasing again. 
+
+Another hyperparameter to consider is the type of trend: linear or logistic. While this time-series does technically have a saturating minimum, as there cannot be a negative number riders, the data values are not approaching zero, so imposing that cutoff is not likely to have a strong impact on the model. Therefore, we will assume that a linear trend is reasonable for this time-series. 
+
+Prophet also allows us to specify additive or multiplicative seasonality. Since there is more variation in ridership during the summer than in the winter, it makes sense to utilize multiplicative seasonality for this data set. 
+
+Also, since this is daily data, we can consider holidays. It's possible that certain holidays may cause a sharp increase or decrease in ridership, so by identifying these days, we allow the model to take that into account when making forecasts. In addition, we can manually specify other days with unusual spikes as "holidays" so that these values don't have as strong of an impact of the model. We will utilize both methods for this data set. 
+
+```{r, warning=FALSE, message=FALSE}
+holidays = tibble(
+  holiday = c('Christmas Day','New Year\'s Day','Martin Luther King Jr. Day',
+              'Presidents\' Day','Memorial Day','Independence Day','Labor Day',
+              'Columbus Day','Veterans Day','Thanksgiving'),
+  day = ymd(c('2024-12-25','2024-01-01','2024-01-15','2024-02-19','2024-05-27',
+               '2024-07-04','2024-09-02','2024-10-14','2024-11-11','2024-11-28')))
+
+special_holidays = streetcar %>%
+as_tibble() %>%
+filter(ridership > 8000) %>%
+select(-ridership) %>%
+mutate(holiday = paste('holiday',row_number()))
+
+final_holidays = holidays %>%
+bind_rows(special_holidays) %>%
+distinct(day,.keep_all = T) %>%
+as_tsibble(index = day)
+
+final_holidays
+```
+
+We determined 8,000 riders to be the cutoff for special "holidays." There are now 14 holidays in total for our model to consider. 
+
+
+The following plot shows the decomposition for this adjusted model. 
+
+```{r, warning=FALSE, message=FALSE}
+#Plot decomposition for initial model
+#With adjusted changepoint_range
+streetcar_train %>%
+  model(prophet = prophet(ridership~growth(changepoint_range=0.9) +
+                          season(period='week',type = 'multiplicative') + 
+                          holiday(final_holidays))) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "Prophet Decomposition for Cincinnati Streetcar Ridership - Tuned Model",
+       x = "Date") +
+  theme_minimal()
+```
+
+After tuning the hyperparameters, we see that the trend line increases, flattens, and then begins to decrease, which matches our visual inspection of the data. Also, the addition of holidays means that these spikes in the data are accounted for in the seasonal component. This allows the residual component to more closely resemble white noise, which indicates that the changes create a better model fit. 
+
+## Section 4: Model Comparison and Validation
+
+In order to determine the best model for our time-series, we will evaluate multiple different models through time-series cross-validation. Our first step is to create CV folds for the training data set. We will set the initial training period at about six months and step forward one week at a time. 
+
+```{r, warning=FALSE, message=FALSE}
+#Set up cross-validation data set
+#Train on ~6 months, step forward one week
+streetcar_cv <- streetcar_train %>%
+  stretch_tsibble(.init = 180, .step = 7)
+
+#Visualize the CV folds
+streetcar_cv %>%
+  ggplot() +
+  geom_point(aes(day, factor(.id), color = factor(.id)), size = 1) +
+  labs(title = "Time Series Cross-Validation Folds",
+       x = "Date", y = "Fold") +
+  guides(color = 'none') +
+  theme_minimal()
+
+```
+
+We will fit and compare three models using cross-validation. We will consider a seasonal naive model, due to identified weekly seasonality in the data, an ARIMA model (as developed in Section 2), and a Prophet model (as developed in Section 3).
+
+```{r, warning=FALSE, message=FALSE}
+#Fit the three models
+#Note: auto-ARIMA is re-estimated within each fold
+cv_models <- streetcar_cv %>%
+  model(snaive = SNAIVE(ridership ~ lag("week")), 
+        arima = ARIMA(log(ridership),approximation = F, stepwise = F), 
+        prophet = prophet(ridership~growth(changepoint_range=0.9) +
+                          season(period='week',type = 'multiplicative') + 
+                          holiday(final_holidays)))
+
+#Forecast one week ahead for each fold
+cv_forecasts <- cv_models %>%
+  forecast(h = 7)
+
+#Visualize forecasts by fold
+#Plot actual vs predicted for each CV fold
+cv_forecasts %>%
+  as_tibble() %>%
+  select(-ridership) %>%
+  left_join(streetcar_train) %>%
+  ggplot() +
+  geom_line(aes(day, ridership), color = "black", linewidth = 0.6) +
+  geom_line(aes(day, .mean, color = factor(.id), linetype = .model)) +
+  scale_color_viridis_d(name = "CV Fold") +
+  scale_linetype_manual(values = c("snaive" = "solid", "arima" = "dashed", 
+                                   "prophet" = "dotted"), name = "Model") +
+  labs(title = "Actual vs Predicted by CV Fold",
+       subtitle = "Black line = actual values; colored lines = forecasts from each fold",
+       x = "Date", y = "Ridership") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+Each of the three models seem to give a reasonable fit to the data. They capture the seasonal trend in the data well, although there are a few points with larger errors. Since the seasonal naive model simply forecasts the value from the last week, it tends to overestimate peaks and troughs in the data more often than ARIMA or Prophet.
+
+To further compare these models, we will look at their performance at each forecast horizon. 
+
+::: {.panel-tabset}
+
+## RMSE
+
+```{r, warning=FALSE, message=FALSE}
+
+#Calculate accuracy by forecast horizon
+cv_accuracy_by_h <- cv_forecasts %>%
+  group_by(.id, .model) %>%
+  mutate(h = row_number()) %>%
+  ungroup() %>%
+  as_fable(response = "ridership", distribution = ridership) %>%
+  accuracy(streetcar_train, by = c("h", ".model"))
+
+#Plot RMSE by horizon
+cv_accuracy_by_h %>%
+  ggplot(aes(x = h, y = RMSE, color = .model)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  labs(title = "RMSE by Forecast Horizon",
+       subtitle = "Prophet appears to slightly outperform other models",
+       x = "Days Ahead", y = "RMSE") +
+  scale_color_manual(values = c("snaive" = "steelblue", "arima" = "coral", 
+                                "prophet" = "green")) +
+  theme_minimal()
+
+
+```
+
+## MAPE
+
+```{r, warning=FALSE, message=FALSE}
+
+#Plot MAPE by horizon
+cv_accuracy_by_h %>%
+  ggplot(aes(x = h, y = MAPE, color = .model)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  labs(title = "MAPE by Forecast Horizon",
+       subtitle = "Prophet appears to slightly outperform other models",
+       x = "Days Ahead", y = "MAPE (%)") +
+  scale_color_manual(values = c("snaive" = "steelblue", "arima" = "coral", 
+                                "prophet" = "green")) +
+  theme_minimal()
+```
+:::
+
+When looking at the RMSE and MAPE across the three models, we see similar trends. The ARIMA model performs best to start, but the Prophet model tends to do better at later points. However, the seasonal naive model actually performs best at five days ahead. The error metrics across all three models are at their lowest when forecasting three to five days ahead, meaning that mid-range forecasts are typically the most accurate.  
+
+We can also look at the overall accuracy of the models. The table below shows the error metrics for the entire training data, as opposed to each cross-validation fold. The Prophet model performs best in every category, so we will proceed with this model. 
+
+```{r, warning=FALSE, message=FALSE}
+
+#Calculate overall accuracy measures
+cv_forecasts %>%
+  accuracy(streetcar_train) %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  arrange(RMSE) %>%
+  kable(align = 'c') %>%
+  kable_styling()
+```
+
+Finally, we will refit the Prophet model to the entire training data and create forecasts on the test set. 
+
+```{r, warning=FALSE, message=FALSE}
+
+#Fit Prophet model on full training data
+test_model <- streetcar_train %>%
+  model(prophet = prophet(ridership~growth(changepoint_range=0.9) +
+                          season(period='week',type = 'multiplicative') + 
+                          holiday(final_holidays)))
+
+#Generate forecast on test set
+test_forecast <- test_model %>%
+  forecast(h = 77) #The size of the test data set 
+
+#Plot with prediction intervals
+test_forecast %>%
+  autoplot(streetcar_train %>% bind_rows(streetcar_test)) + 
+  geom_line(data = streetcar_test, aes(day, ridership),
+            color = "black", linewidth = 1) +
+  labs(title = "Test Set: Forecast vs Actual (10/15-12/31)",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+
+
+```
+
+These forecasts seem to be very close to the actual values from the data. They capture the slight downward trend at the end of the year and the test set falls almost entirely within the prediction intervals, with the exception of the high outlier. The table below summarizes the accuracy of the model on the test set. 
+
+```{r}
+#Test set accuracy
+test_accuracy <- test_forecast %>%
+  accuracy(streetcar_train %>% bind_rows(streetcar_test))
+
+test_accuracy %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  kable(align = 'c') %>%
+  kable_styling()
+```
+
+Our model performed with 18.9% average deviation from real values during out-of-sample testing. This corresponds to an average error of 1,538 riders. These values are higher than the in-sample values for the Prophet model, particularly for the RMSE, which could be a sign of overfitting. However, as already noted, there is a large outlier in the test set that is likely skewing the results. Since the MAPE and other error metrics are closer to the in-sample values, this indicates that the model is still a good fit overall. 
+
+Finally, we will refit the model to the entire data set and create a four-week future forecast. 
+
+```{r}
+#Fit Prophet model on full data
+final_model <- streetcar %>%
+  model(prophet = prophet(ridership~growth(changepoint_range=0.9) +
+                          season(period='week',type = 'multiplicative') + 
+                          holiday(final_holidays)))
+
+#Generate final forecast
+final_forecast <- final_model %>%
+  forecast(h = 28) #Four week forecast 
+
+#Plot with prediction intervals
+final_forecast %>%
+  autoplot(streetcar) +
+  labs(title = "Four-Week Future Forecast",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+
+```
+
+Overall, these forecasts seem reasonable for the data set. They capture the weekly seasonal trend and are consistent with the latest level of the time series. The only potential issue is the continuation of the slight downward trend from the end of 2024. We only have one year of data to reference, but we can assume that ridership likely has some kind of annual trend and will slowly start to increase again. Due to the lack of historical data, the forecasts can't incorporate this, so long-term ridership forecasts will likely not be very accurate. 

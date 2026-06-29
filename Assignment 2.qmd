@@ -1,0 +1,209 @@
+---
+title: 'Assignment 2: Time Series Data Description, Exploratory Analysis, and Decomposition'
+author: "Megan Mattingly"
+format: 
+  html:
+    fig-align: center # Center figure alignment
+    embed-resources: true # Force document to be self-contained (critical!)
+    code-fold: true # Turn on code fold
+    toc: true # Create table of contents
+execute: 
+  warning: false # Turn off warnings
+---
+
+# Section 1
+This analysis will be done using the Cincinnati Streetcar Ridership data set. The streetcar is a form of free public transportation in downtown Cincinnati that connects the Banks to Over-the-Rhine. It covers a 3.6 mile loop and there are 5 streetcars. This data set contains daily ridership data from 2024. The streetcar utilizes sensors on the doorways of each car to approximate the number of riders entering and exiting. Although the streetcar is owned by the city of Cincinnati, this data is provided by the Southwest Ohio Regional Transit Authority.  
+
+The data-generating process is tied to the overall number of people in downtown Cincinnati. There are likely more streetcar riders when people are out exploring the area, like in the evenings or on weekends. Also, we would probably see an increase in riders if there are events going on in the Banks or OTR, like games and concerts. While these types of events are known about in advance, they don't follow the same schedule every year. For example, the dates of home sports games change from season to season, and musicians don't go on tour at predictable intervals. This fluidity may make it more difficult to forecast streetcar ridership accurately, but I think the overall trend can be captured. 
+
+# Section 2
+
+Next, we will visualize the time series in order to better understand the behavior of the data. 
+
+```{r, message = FALSE}
+library(readr)
+library(ggplot2)
+library(tsibble)
+library(dplyr)
+library(fable)
+library(feasts)
+library(kableExtra)
+library(patchwork)
+
+#Import data
+streetcar_raw <- read_csv("streetcar_ridership.csv")
+
+#Convert to tsibble
+streetcar <- streetcar_raw %>%
+  mutate(day = date(date)) %>%
+  as_tsibble(index = day) %>%
+  select(day, ridership)
+
+#Time series plot
+streetcar %>%
+  autoplot(ridership) +
+  labs(title = "Cincinnati Streetcar Ridership",
+       x = "Date", y = "Riders") +
+  theme_bw()
+
+
+```
+
+The line chart above shows daily streetcar ridership for 2024. While ridership increases slightly in the summer, there is not a lot of variation in the overall trend. Most of the peaks and troughs in the data are very consistent, meaning that they may be driven by a seasonal component. There is one exceptionally large peak in October 2024, which could be considered an outlier. 
+
+The following plots describe the data distribution. 
+
+```{r, message=FALSE}
+#Histogram of data distribution
+p1 <- streetcar %>%
+  ggplot() +
+  geom_histogram(aes(ridership)) +
+  labs(x = "Riders", y = "Count") +
+  theme_bw()
+
+#Boxplot
+p2 <- streetcar %>%
+  ggplot() +
+  geom_boxplot(aes("", ridership)) +
+  labs(y = "Riders") + 
+  theme_bw()
+
+p1 + p2
+```
+
+These plots indicate that there are likely some outliers in the data. Specifically, there were two days where ridership was over 10,000, which is out of the ordinary. Even if we ignore these points, the histogram shows that the data is still right skewed, meaning that there tends to be more days with fewer riders. 
+
+
+```{r}
+# Summary statistics
+streetcar %>%
+  features(ridership, list(
+    Mean = mean,
+    Median = median,
+    StandardDeviation = sd,
+    Minimum = min,
+    Maximum = max,
+    Q1 = ~ quantile(., 0.25),
+    Q3 = ~ quantile(., 0.75)))  %>% 
+      kable() %>%
+        kable_styling()
+```
+
+We also calculated general summary statistics for streetcar ridership. The mean is higher than the median, which is numeric confirmation of right skewed data. There is a large difference in values between the third quartile and the maximum of the data, which indicates that there is a small number of days with high ridership. This goes back to our initial idea that special events, which usually don't follow a predictable schedule, can cause large fluctuations in the data.  
+
+
+# Section 3
+
+We calculated a 31-order moving average for the data and plotted it against the original data below. 
+
+```{r}
+
+#Calculate moving average (order 31)
+streetcar_ma <- streetcar %>%
+  mutate(ma = slider::slide_dbl(ridership, mean, .before = 15, .after = 15))
+
+#Plot against original data
+streetcar_ma %>%
+  pivot_longer(cols = c(ridership, ma),
+               names_to = "series", values_to = "val") %>%
+  mutate(series = factor(series,
+                         levels = c("ridership", "ma"),
+                         labels = c("Original", "MA"))) %>%
+  ggplot(aes(x = day, y = val, color = series)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("Original" = "black", "MA" = "red")) + 
+  labs(title = "Cincinnati Streetcar Ridership with Moving Average",
+       x = "Date", y = "Riders", color = "Series") +
+  theme_bw()
+
+```
+
+The moving average, shown in red, indicates that ridership increases between January and July, before decreasing for the rest of the year. We see a peak in October due to the large outlier discussed above. 
+
+Next, we will detrend the data in order to look for any remaining patterns. 
+```{r}
+#Estimate trend using 31-period MA and decompose
+streetcar_decomp <- streetcar %>%
+  mutate(
+    trend = slider::slide_dbl(ridership, mean, .before = 15, .after = 15),
+    remainder = ridership - trend
+  )
+
+#Plot decomposition
+streetcar_decomp %>%
+  pivot_longer(cols = c(ridership, trend, remainder),
+               names_to = "component", values_to = "val") %>%
+  mutate(component = factor(component,
+                            levels = c("ridership", "trend", "remainder"),
+                            labels = c("Original", "Trend", "Remainder"))) %>%
+  ggplot(aes(x = day, y = val)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~component, ncol = 1, scales = "free_y") +
+  labs(title = "Manual Trend Decomposition - Cincinnati Streetcar Ridership",
+       x = "Date", y = "") +
+  theme_bw()
+
+```
+
+Based these charts, it appears that there is some seasonality in the data. The remainder component is not random, which means that there is more information about the data generating process than just what is captured in the trend. In order to further investigate potential seasonality, we will look at the remainder component and calculate ridership by week and by month.  
+
+```{r}
+#Check for seasonality after detrending
+#Aggregate by week
+p3 <- streetcar_decomp %>%
+  mutate(wday_num = wday(day)) %>%
+  ggplot(aes(factor(wday_num), remainder)) + 
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  scale_x_discrete(labels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")) +
+  labs(title = "Cincinnati Streetcar Ridership by Week - After Detrending",
+       x = "Day of Week", y = "Remainder") +
+  geom_hline(yintercept=0,color='red') + 
+  theme_bw()
+
+#Aggregate by month
+p4 <- streetcar_decomp %>%
+  mutate(month_num = month(day)) %>%
+  ggplot(aes(factor(month_num), remainder)) + 
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  scale_x_discrete(labels = month.abb) +
+  labs(title = "Cincinnati Streetcar Ridership by Month - After Detrending",
+       x = "Day of Month", y = "Remainder") +
+  geom_hline(yintercept=0,color='red') + 
+  theme_bw()
+
+p3/p4
+```
+
+Based on the first box plot, we can see that ridership on Saturdays is higher than the other days of the week. This means that there is some weekly seasonality, but it is definitely not as strong as expected. However, there is not much variation between months, meaning that our data does not have any monthly seasonality. We can also compute a full time series decomposition. 
+
+```{r}
+#STL decomposition and plot 
+streetcar %>%
+  model(STL(ridership)) %>%
+  components() %>% 
+    autoplot() + 
+      labs(title = "STL Decomposition - Cincinnnati Streetcar Ridership") + 
+      theme_bw()
+
+```
+
+The STL decomposition shown above confirms that there is weekly seasonality in the data. Also, the remainder component now looks more random, which is a sign that we are better capturing the data generating process. 
+
+# Section 4
+
+Finally, we will create a 6 day forecast for our time series. Since there is some seasonality in the data, we will use the seasonal naive method to generate predictions. 
+
+```{r}
+#Naive forecast
+streetcar %>%
+  model(snaive = SNAIVE(ridership ~ lag("week"))) %>%
+  forecast(h = 6) %>%
+  autoplot(streetcar, level = NULL,size=1) +
+  geom_vline(aes(xintercept = ymd("2025-01-01")), color = "red", linetype = "dashed") +
+  theme_bw()+
+  ylab('Riders')
+
+```
+
+This forecast does seem to do a good job of representing the data. First, it matches the seasonality pattern well. Also, the trend in the data is not very steep, so a naive forecast is reasonable. There is not a very strong increase or decrease from one week to the next, so it makes sense to forecast the first week of 2025 with the same values as the last week of 2024. 
+

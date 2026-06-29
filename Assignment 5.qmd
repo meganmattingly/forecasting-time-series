@@ -1,0 +1,405 @@
+---
+title: 'Assignment 5: Forecasting with Prophet'
+author: "Megan Mattingly"
+format: 
+  html:
+    fig-align: center # Center figure alignment
+    embed-resources: true # Force document to be self-contained (critical!)
+    code-fold: true # Turn on code fold
+    toc: true # Create table of contents
+execute: 
+  warning: false # Turn off warnings
+---
+
+# Section 1
+
+The Prophet model for time-series forecasting is a relatively new approach. It was developed by Facebook (now Meta) in 2017. The basis of the model comes from time-series decomposition and includes trend, seasonal, and holiday components. Some benefits of Prophet are ease of implementation, the ability to handle multiple types of seasonality, and resistance to outliers. It is also important to note that Prophet models work best with daily data, due to the holiday component, and do not tend to perform well with non-seasonal data. Since the Cincinnati streetcar ridership data is collected daily and has some weekly seasonality, this means that Prophet is a reasonable approach. The plot below shows forecasts made using a Prophet model with default parameters. 
+
+
+```{r, warning=FALSE, message=FALSE}
+library(readr)
+library(ggplot2)
+library(tsibble)
+library(tidyverse)
+library(fable)
+library(fable.prophet)
+#library(feasts)
+library(kableExtra)
+#library(patchwork)
+
+#Import data
+streetcar_raw <- read_csv("streetcar_ridership.csv")
+
+#Convert to tsibble
+streetcar <- streetcar_raw %>%
+  mutate(day = date(date)) %>%
+  as_tsibble(index = day) %>%
+  select(day, ridership)
+
+#Split into train and test sets (approx 80/20)
+streetcar_train <- streetcar %>%
+  filter(day <= '2024-10-15')
+
+streetcar_test <- streetcar %>%
+  filter(day > '2024-10-15')
+
+#Fit basic Prophet model
+streetcar_train %>%
+  model(prophet = prophet(ridership)) %>%
+  forecast(h = 77) %>%
+  autoplot(streetcar) +
+  labs(title = "Cincinnati Streetcar Ridership",
+       subtitle = "Forecasts made using basic Prophet model",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+
+```
+
+The predicted values do not match the actual values very closely. The Prophet model is consistently overestimating the observed data, meaning that hyperparameter tuning will be necessary. 
+
+
+# Section 2
+
+First, we will examine the elements of the time-series decomposition as identified by the default Prophet model. The plot below shows the trend, seasonality, and residual components. 
+
+```{r, warning=FALSE, message=FALSE}
+#Plot decomposition for initial model
+streetcar_train %>%
+  model(prophet = prophet(ridership)) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "Prophet Decomposition for Cincinnati Streetcar Ridership",
+       x = "Date") +
+  theme_minimal()
+```
+
+Prophet has identified a strictly increasing trend with additive seasonality. It appears that the residuals may not be entirely white noise. 
+
+Next, we will examine the changepoints identified for the trend of the time-series.
+
+::: {.panel-tabset}
+
+## Considered Changepoints - Default
+
+```{r, warning=FALSE, message=FALSE}
+#Examine considered changepoints for trend component
+changepoints = streetcar_train %>%
+  model(prophet = prophet(ridership)) %>%
+  glance() %>%
+  pull(changepoints) %>%
+  bind_rows() %>%
+  .$changepoints
+
+#Plot against training data
+streetcar_train %>%
+  ggplot()+
+  geom_line(aes(day, ridership)) +
+  geom_vline(xintercept = as.Date(changepoints),color = 'red',linetype = 'dashed') + 
+  labs(title = "Considered Changepoints",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+  
+```
+
+## Selected Changepoints - Default
+
+```{r, warning=FALSE, message=FALSE}
+#Examine selected changepoints for trend component
+changepoints = streetcar_train %>%
+  model(prophet = prophet(ridership)) %>%
+  glance() %>%
+  pull(changepoints) %>%
+  bind_rows() %>%
+   filter(abs(adjustment)>0.01) %>%
+  .$changepoints
+
+#Plot against training data
+streetcar_train %>%
+  ggplot()+
+  geom_line(aes(day, ridership)) +
+  geom_vline(xintercept = as.Date(changepoints),color = 'red',linetype = 'dashed') + 
+  labs(title = "Selected Changepoints",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+
+```
+:::
+
+These plots show that although 25 changepoints were considered for this time-series, none were selected as having high rates of change. This explains why the trend is a straight line. In order to more accurately capture the data-generating process, we can adjust some of the hyperparameters for the trend component. 
+
+By default, Prophet does not look at changepoints in the last 20% of the data, but we can see that ridership does start to decrease in the fall. Adjusting the range of the data where changepoints can be identified may allow this trend to be captured and make our model more accurate. Going forward, we will allow changepoints to be selected for the first 90% of the data.
+
+::: {.panel-tabset}
+
+## Considered Changepoints - Tuned
+
+```{r, warning=FALSE, message=FALSE}
+#Examine considered changepoints for trend component
+changepoints = streetcar_train %>%
+  model(prophet = prophet(ridership~growth(changepoint_range=0.9)+
+                            season(period='week'))) %>%
+  glance() %>%
+  pull(changepoints) %>%
+  bind_rows() %>%
+  .$changepoints
+
+#Plot against training data
+streetcar_train %>%
+  ggplot()+
+  geom_line(aes(day, ridership)) +
+  geom_vline(xintercept = as.Date(changepoints),color = 'red',linetype = 'dashed') + 
+  labs(title = "Considered Changepoints - 90% of Data",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+  
+```
+
+## Selected Changepoints - Tuned
+
+```{r, warning=FALSE, message=FALSE}
+#Examine selected changepoints for trend component
+changepoints = streetcar_train %>%
+  model(prophet = prophet(ridership~growth(changepoint_range=0.9)+
+                            season(period='week'))) %>%
+  glance() %>%
+  pull(changepoints) %>%
+  bind_rows() %>%
+   filter(abs(adjustment)>0.01) %>%
+  .$changepoints
+
+#Plot against training data
+streetcar_train %>%
+  ggplot()+
+  geom_line(aes(day, ridership)) +
+  geom_vline(xintercept = as.Date(changepoints),color = 'red',linetype = 'dashed') + 
+  labs(title = "Selected Changepoints - 90% of Data",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+
+```
+:::
+
+Now, we see that the model has identified 13 changepoints in the data. They fall towards the middle of the data set, which makes sense, as this is where ridership starts to level off before decreasing again. We can also plot the decomposition for this adjusted model. 
+
+```{r, warning=FALSE, message=FALSE}
+#Plot decomposition for initial model
+#With adjusted changepoint_range
+streetcar_train %>%
+  model(prophet = prophet(ridership~growth(changepoint_range=0.9)+
+                            season(period='week'))) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "Prophet Decomposition for Cincinnati Streetcar Ridership",
+       x = "Date") +
+  theme_minimal()
+```
+
+After tuning the hyperparameter, we see that the trend line increases, flattens, and then begins to decrease, which matches our visual inspection of the data. This indicates that the change will likely improve the model. 
+
+Another hyperparameter to consider is the type of trend: linear or logistic. While this time-series does technically have a saturating minimum, as there cannot be a negative number riders, the data values are not approaching zero, so imposing that cutoff is not likely to have a strong impact on the model. Therefore, we will assume that a linear trend is reasonable for this time-series. 
+
+
+# Section 3
+
+From prior analysis, we know that there is weekly seasonality in the data set, and this is confirmed in the table below. The deafult Prophet model identifies this as additive seasonality, meaning that the variation does not change according to the level of the time-series. 
+
+```{r, warning=FALSE, message=FALSE}
+#Examine seasonality in the model
+streetcar_train %>%
+  model(prophet = prophet(ridership~growth(changepoint_range=0.9)+
+                            season(period='week'))) %>%
+  components() 
+```
+
+Also, since this is daily data, we can consider holidays. It's possible that certain holidays may cause a sharp increase or decrease in ridership, so by identifying these days, we allow the model to take that into account when making forecasts. In addition, we can manually specify other days with unusual spikes as "holidays" so that these values don't have as strong of an impact of the model. We will utilize both methods for this data set. 
+
+```{r, warning=FALSE, message=FALSE}
+holidays = tibble(
+  holiday = c('Christmas Day','New Year\'s Day','Martin Luther King Jr. Day',
+              'Presidents\' Day','Memorial Day','Independence Day','Labor Day',
+              'Columbus Day','Veterans Day','Thanksgiving'),
+  day = ymd(c('2024-12-25','2024-01-01','2024-01-15','2024-02-19','2024-05-27',
+               '2024-07-04','2024-09-02','2024-10-14','2024-11-11','2024-11-28')))
+
+special_holidays = streetcar %>%
+as_tibble() %>%
+filter(ridership > 8000) %>%
+select(-ridership) %>%
+mutate(holiday = paste('holiday',row_number()))
+
+final_holidays = holidays %>%
+bind_rows(special_holidays) %>%
+distinct(day,.keep_all = T) %>%
+as_tsibble(index = day)
+
+final_holidays
+```
+
+We will consider 8,000 riders to be the cutoff for special "holidays." There are now 14 holidays in total for our model to consider. 
+
+
+# Section 4
+
+In order to evaluate the performance of the Prophet model, we will perform time-series cross-validation. Our first step is to create CV folds for the training data set. We will set the initial training period at about six months and step forward one week at a time. 
+
+```{r, warning=FALSE, message=FALSE}
+#Set up cross-validation data set
+#Train on ~6 months, step forward one week
+streetcar_cv <- streetcar_train %>%
+  stretch_tsibble(.init = 180, .step = 7)
+
+#Visualize the CV folds
+streetcar_cv %>%
+  ggplot() +
+  geom_point(aes(day, factor(.id), color = factor(.id)), size = 1) +
+  labs(title = "Time Series Cross-Validation Folds",
+       x = "Date", y = "Fold") +
+  guides(color = 'none') +
+  theme_minimal()
+
+```
+
+We will compare multiple Prophet models with different parameters. The baseline model will be the Prophet with changepoints identified for 90% of the data, as examined earlier in this analysis. Also, we will consider a model with multiplicative seasonality instead of additive and a model with fewer selected changepoints. The 7-day forecasts for each model on each CV fold are shown in the plot below. 
+
+```{r, warning=FALSE, message=FALSE}
+#Fit variations of Prophet
+cv_models <- streetcar_cv %>%
+  model(basic = prophet(ridership~growth(changepoint_range=0.9) +
+                            season(period='week')), 
+        mult = prophet(ridership~growth(changepoint_range=0.9) +
+                            season(period='week',type = 'multiplicative')), 
+        less_flex = prophet(ridership~growth(changepoint_range=0.9, 
+                              changepoint_prior_scale = 0.01) + season(period='week')))
+
+#Forecast one week ahead for each fold
+cv_forecasts <- cv_models %>%
+  forecast(h = 7)
+
+#Visualize forecasts by fold
+#Plot actual vs predicted for each CV fold
+cv_forecasts %>%
+  as_tibble() %>%
+  select(-ridership) %>%
+  left_join(streetcar_train) %>%
+  ggplot() +
+  geom_line(aes(day, ridership), color = "black", linewidth = 0.6) +
+  geom_line(aes(day, .mean, color = factor(.id), linetype = .model)) +
+  scale_color_viridis_d(name = "CV Fold") +
+  scale_linetype_manual(values = c("basic" = "solid", "mult" = "dashed", 
+                                   "less_flex" = "dotted"), name = "Model") +
+  labs(title = "Actual vs Predicted by CV Fold",
+       subtitle = "Black line = actual values; colored lines = forecasts from each fold",
+       x = "Date", y = "Ridership") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+The three models produce similar forecasts and all seem to be fitting the data fairly well. However, at later points in the training set, the basic Prophet and the Prophet with multiplicative seasonality are outperforming the Prophet with fewer changepoints. 
+
+To further compare these models, we will look at their performance at each forecast horizon. 
+
+::: {.panel-tabset}
+
+## RMSE
+
+```{r, warning=FALSE, message=FALSE}
+
+#Calculate accuracy by forecast horizon
+cv_accuracy_by_h <- cv_forecasts %>%
+  group_by(.id, .model) %>%
+  mutate(h = row_number()) %>%
+  ungroup() %>%
+  as_fable(response = "ridership", distribution = ridership) %>%
+  accuracy(streetcar_train, by = c("h", ".model"))
+
+#Plot RMSE by horizon
+cv_accuracy_by_h %>%
+  ggplot(aes(x = h, y = RMSE, color = .model)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  labs(title = "RMSE by Forecast Horizon",
+       subtitle = "Prophet with multiplicative seasonality slightly outperforms baseline",
+       x = "Days Ahead", y = "RMSE") +
+  scale_color_manual(values = c("basic" = "steelblue", "mult" = "coral", 
+                                "less_flex" = "green")) +
+  theme_minimal()
+
+
+```
+
+## MAPE
+
+```{r, warning=FALSE, message=FALSE}
+
+#Plot MAPE by horizon
+cv_accuracy_by_h %>%
+  ggplot(aes(x = h, y = MAPE, color = .model)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  labs(title = "MAPE by Forecast Horizon",
+       subtitle = "Prophet with multiplicative seasonality slightly outperforms baseline",
+       x = "Days Ahead", y = "MAPE (%)") +
+  scale_color_manual(values = c("basic" = "steelblue", "mult" = "coral", 
+                                "less_flex" = "green")) +
+  theme_minimal()
+```
+:::
+
+When looking at the RMSE and MAPE across the three models, we see similar trends. Overall, the Prophet model with multiplicative seasonality performs the best. However, the baseline Prophet model is slightly better at one and seven days ahead. The Prophet model with fewer selected changepoints has the highest error at all horizons. 
+
+We also look at the overall accuracy of the models. The table below shows these metrics for the entire training data, as opposed to each cross-validation fold. These values confirm what we saw in the plots. Although they are close, the Prophet with multiplicative seasonality performs better than the baseline Prophet in every category, so we will proceed with this model. 
+
+```{r, warning=FALSE, message=FALSE}
+
+#Calculate overall accuracy measures
+cv_forecasts %>%
+  accuracy(streetcar_train) %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  arrange(RMSE) %>%
+  kable(align = 'c') %>%
+  kable_styling()
+```
+
+
+Finally, we will refit the selected Prophet model to the entire training data and create forecasts on the test set. 
+
+```{r, warning=FALSE, message=FALSE}
+
+#Fit ARIMA model on full training data
+final_model <- streetcar_train %>%
+  model(mult = prophet(ridership~growth(changepoint_range=0.9) +
+                            season(period='week',type = 'multiplicative')))
+
+#Generate final forecast
+final_forecast <- final_model %>%
+  forecast(h = 77) #The size of the test data set 
+
+#Plot with prediction intervals
+final_forecast %>%
+  autoplot(streetcar_train %>% bind_rows(streetcar_test)) + 
+  geom_line(data = streetcar_test, aes(day, ridership),
+            color = "black", linewidth = 1) +
+  labs(title = "Final Prophet Forecast vs Actual (10/15-12/31)",
+       x = "Date", y = "Ridership") +
+  theme_minimal()
+
+
+```
+
+These forecasts seem to be very close to the actual values from the data. They capture the slight downward trend at the end of the year and the test set falls almost entirely within the prediction intervals, with the exception of the high outlier. The table below summarizes the accuracy of the model on the test set. 
+
+```{r}
+#Final accuracy
+final_accuracy <- final_forecast %>%
+  accuracy(streetcar_train %>% bind_rows(streetcar_test))
+
+final_accuracy %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  kable(align = 'c') %>%
+  kable_styling()
+```
+
+Our model performed with 20.6% average deviation from real values during out-of-sample testing. This corresponds to an average error of 1,507 riders. These values are higher than the in-sample values for the Prophet model with multiplicative seasonality, particularly for the RMSE, which could be a sign of overfitting. However, as already noted, there is a large outlier in the test set that is likely skewing the results. Since the MAPE and other error metrics are closer to the in-sample values, this indicates that the model is still a good fit overall. 
+
+
